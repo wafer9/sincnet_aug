@@ -19,13 +19,72 @@ import re
 import tarfile
 from subprocess import PIPE, Popen
 from urllib.parse import urlparse
+import math
 
 import torch
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 from torch.nn.utils.rnn import pad_sequence
+from torch import Tensor
+
 
 AUDIO_FORMAT_SETS = set(['flac', 'mp3', 'm4a', 'ogg', 'opus', 'wav', 'wma'])
+EPSILON = torch.tensor(torch.finfo(torch.float).eps)
+
+def to_mel(hz):
+    return 2595 * math.log(1 + hz / 700, 10)
+
+def to_hz(mel):
+    return 700 * (10 ** (mel / 2595) - 1)
+
+
+def get_filters(sample_rate=16000,
+                kernel_size=251,
+                low=-1,
+                high=-1):
+    n = (kernel_size - 1) / 2.0
+    idx_left = torch.arange(-n, 0)
+    idx_right = torch.flip(idx_left, dims=[0]) * -1
+
+    nyquist = sample_rate // 2
+    band = torch.tensor(nyquist - (high - low))
+
+    n_ = 2 * math.pi * idx_left.view(1, -1) / sample_rate
+    window_ = 0.54 - 0.46 * torch.cos(2*math.pi * idx_right / kernel_size)
+
+    band_pass_left = (torch.sin(nyquist * n_) - torch.sin(high * n_) + torch.sin(low * n_))/(n_/2) * window_
+    band_pass_center = 2 * band.view(-1, 1)
+    band_pass_right = torch.flip(band_pass_left, dims=[1])
+
+    band_pass = torch.cat([band_pass_left, band_pass_center, band_pass_right], dim=1)
+    band_pass = band_pass / (2 * band)
+
+    filters = band_pass.view(1, 1, kernel_size)
+    return filters
+
+
+def get_strided(waveform: Tensor, window_size: int, window_shift: int) -> Tensor:
+    """ Args:
+            waveform: (channel, num_samples)
+            window_size: int
+            window_shift: int
+        Returns:
+            waveform: (-1, window_size)
+    """
+    waveform = waveform.squeeze(0)
+    num_samples = waveform.size(0)
+    strides = (window_shift * waveform.stride(0), waveform.stride(0))
+
+    pad_size = window_size // 2 - window_shift // 2
+    pad = torch.zeros(pad_size)
+    waveform = torch.cat((pad, waveform, pad), dim=0)
+
+    num_samples = waveform.size(0)
+    m = (num_samples - pad_size * 2) // window_shift
+    sizes = (m, window_size)
+
+    waveform = waveform.as_strided(sizes, strides)
+    return waveform
 
 
 def url_opener(data):
@@ -250,73 +309,95 @@ def speed_perturb(data, speeds=None):
         yield sample
 
 
-def compute_fbank(data,
-                  num_mel_bins=23,
-                  frame_length=25,
-                  frame_shift=10,
-                  dither=0.0):
+def spec_aug(data, num_t_mask=2, num_f_mask=2, max_t=0.5, max_f=10, kernel_size=251):
+    """ Do spec augmentation
+        Inplace operation
+
+        Args:
+            data: Iterable[{key, wav, label, sample_rate}]
+            num_t_mask: number of time mask to apply
+            num_f_mask: number of freq mask to apply
+            max_t: max width of time mask
+            max_f: max width of freq mask
+            kernel_size:
+
+        Returns
+            Iterable[{key, wav, label, sample_rate}]
+    """
+    for sample in data:
+        assert 'sample_rate' in sample
+        assert 'wav' in sample
+        assert 'key' in sample
+        assert 'label' in sample
+        sample_rate = sample['sample_rate']
+        waveform = sample['wav'] # (channel, num_samples)
+
+        # time mask
+        num_samples = waveform.size(1)
+        for i in range(num_t_mask):
+            start = random.randint(0, num_samples - 1)
+            length = random.randint(1, max_t * sample_rate)
+            end = min(num_samples, start + length)
+            waveform[:, start:end] = 0
+
+        # freq mask
+        max_freq = sample_rate // 2
+        max_mel_freq = to_mel(max_freq)
+        max_f_mel = int(max_mel_freq / 80 * max_f)
+        for i in range(num_f_mask):
+            strided_input = get_strided(waveform,
+                                        window_size=int(0.1 * sample_rate + (kernel_size - 1)),
+                                        window_shift=int(0.1 * sample_rate))
+            strided_input = strided_input.unsqueeze(1)
+
+            start_mel = random.randint(0, int(max_mel_freq))
+            length_mel = random.randint(1, max_f_mel)
+            end_mel = min(max_mel_freq, start_mel + length_mel)
+            start_hz = to_hz(start_mel)
+            end_hz = to_hz(end_mel)
+            filters = get_filters(sample_rate=sample_rate, kernel_size=kernel_size,
+                                  low=start_hz, high=end_hz)
+            waveform = torch.nn.functional.conv1d(strided_input, filters)
+            waveform = waveform.squeeze(1).view(1, -1)
+
+        sample['wav'] = waveform
+        yield sample
+
+
+def dsp(data,
+        dither=0.0,
+        remove_dc_offset=True,
+        preemphasis_coefficient = 0.97):
     """ Extract fbank
 
         Args:
             data: Iterable[{key, wav, label, sample_rate}]
 
         Returns:
-            Iterable[{key, feat, label}]
+            Iterable[{key, wav, label, sample_rate}]
     """
     for sample in data:
-        assert 'sample_rate' in sample
         assert 'wav' in sample
-        assert 'key' in sample
-        assert 'label' in sample
-        sample_rate = sample['sample_rate']
         waveform = sample['wav']
+        device, dtype = waveform.device, waveform.dtype
         waveform = waveform * (1 << 15)
-        # Only keep key, feat, label
-        mat = kaldi.fbank(waveform,
-                          num_mel_bins=num_mel_bins,
-                          frame_length=frame_length,
-                          frame_shift=frame_shift,
-                          dither=dither,
-                          energy_floor=0.0,
-                          sample_frequency=sample_rate)
-        yield dict(key=sample['key'], label=sample['label'], feat=mat)
-
-
-def compute_mfcc(data,
-                 num_mel_bins=23,
-                 frame_length=25,
-                 frame_shift=10,
-                 dither=0.0,
-                 num_ceps=40,
-                 high_freq=0.0,
-                 low_freq=20.0):
-    """ Extract mfcc
-
-        Args:
-            data: Iterable[{key, wav, label, sample_rate}]
-
-        Returns:
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'sample_rate' in sample
-        assert 'wav' in sample
-        assert 'key' in sample
-        assert 'label' in sample
-        sample_rate = sample['sample_rate']
-        waveform = sample['wav']
-        waveform = waveform * (1 << 15)
-        # Only keep key, feat, label
-        mat = kaldi.mfcc(waveform,
-                         num_mel_bins=num_mel_bins,
-                         frame_length=frame_length,
-                         frame_shift=frame_shift,
-                         dither=dither,
-                         num_ceps=num_ceps,
-                         high_freq=high_freq,
-                         low_freq=low_freq,
-                         sample_frequency=sample_rate)
-        yield dict(key=sample['key'], label=sample['label'], feat=mat)
+        if dither != 0.0:
+            # Returns a random number strictly between 0 and 1
+            x = torch.max(EPSILON, torch.rand(waveform.shape, device=device, dtype=dtype))
+            rand_gauss = torch.sqrt(-2 * x.log()) * torch.cos(2 * math.pi * x)
+            waveform = waveform + rand_gauss * dither
+        if remove_dc_offset:
+            # Subtract each row/frame by its mean
+            row_means = torch.mean(waveform, dim=1).unsqueeze(1)  # size (m, 1)
+            waveform = waveform - row_means
+        if preemphasis_coefficient != 0.0:
+            # waveform[i,j] -= preemphasis_coefficient * waveform[i, max(0, j-1)] for all i,j
+            offset_waveform = torch.nn.functional.pad(waveform.unsqueeze(0), (1, 0), mode="replicate").squeeze(
+                0
+            )  # size (m, window_size + 1)
+            waveform = waveform - preemphasis_coefficient * offset_waveform[:, :-1]
+        sample['feat'] = waveform.transpose(0, 1)
+        yield sample
 
 
 def __tokenize_by_bpe_model(sp, txt):
@@ -402,96 +483,6 @@ def tokenize(data,
 
         sample['tokens'] = tokens
         sample['label'] = label
-        yield sample
-
-
-def spec_aug(data, num_t_mask=2, num_f_mask=2, max_t=50, max_f=10, max_w=80):
-    """ Do spec augmentation
-        Inplace operation
-
-        Args:
-            data: Iterable[{key, feat, label}]
-            num_t_mask: number of time mask to apply
-            num_f_mask: number of freq mask to apply
-            max_t: max width of time mask
-            max_f: max width of freq mask
-            max_w: max width of time warp
-
-        Returns
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'feat' in sample
-        x = sample['feat']
-        assert isinstance(x, torch.Tensor)
-        y = x.clone().detach()
-        max_frames = y.size(0)
-        max_freq = y.size(1)
-        # time mask
-        for i in range(num_t_mask):
-            start = random.randint(0, max_frames - 1)
-            length = random.randint(1, max_t)
-            end = min(max_frames, start + length)
-            y[start:end, :] = 0
-        # freq mask
-        for i in range(num_f_mask):
-            start = random.randint(0, max_freq - 1)
-            length = random.randint(1, max_f)
-            end = min(max_freq, start + length)
-            y[:, start:end] = 0
-        sample['feat'] = y
-        yield sample
-
-
-def spec_sub(data, max_t=20, num_t_sub=3):
-    """ Do spec substitute
-        Inplace operation
-
-        Args:
-            data: Iterable[{key, feat, label}]
-            max_t: max width of time substitute
-            num_t_sub: number of time substitute to apply
-
-        Returns
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'feat' in sample
-        x = sample['feat']
-        assert isinstance(x, torch.Tensor)
-        y = x.clone().detach()
-        max_frames = y.size(0)
-        for i in range(num_t_sub):
-            start = random.randint(0, max_frames - 1)
-            length = random.randint(1, max_t)
-            end = min(max_frames, start + length)
-            # only substitute the earlier time chosen randomly for current time
-            pos = random.randint(0, start)
-            y[start:end, :] = x[start - pos:end - pos, :]
-        sample['feat'] = y
-        yield sample
-
-
-def spec_trim(data, max_t=20):
-    """ Trim tailing frames. Inplace operation.
-        ref: Rapid-U2++ [arxiv link]
-
-        Args:
-            data: Iterable[{key, feat, label}]
-            max_t: max width of length trimming
-
-        Returns
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'feat' in sample
-        x = sample['feat']
-        assert isinstance(x, torch.Tensor)
-        max_frames = x.size(0)
-        length = random.randint(1, max_t)
-        if length < max_frames / 2:
-            y = x.clone().detach()[:max_frames - length]
-            sample['feat'] = y
         yield sample
 
 
@@ -582,8 +573,9 @@ def dynamic_batch(data, max_frames_in_batch=12000):
     longest_frames = 0
     for sample in data:
         assert 'feat' in sample
+        assert 'sample_rate' in sample
         assert isinstance(sample['feat'], torch.Tensor)
-        new_sample_frames = sample['feat'].size(0)
+        new_sample_frames = sample['feat'].size(0) / sample['sample_rate'] * 100
         longest_frames = max(longest_frames, new_sample_frames)
         frames_after_padding = longest_frames * (len(buf) + 1)
         if frames_after_padding > max_frames_in_batch:

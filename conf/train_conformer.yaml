@@ -43,15 +43,14 @@ dataset_conf:
     resample_conf:
         resample_rate: 16000
     speed_perturb: true
-    fbank_conf:
-        num_mel_bins: 80
-        frame_shift: 10
-        frame_length: 25
+    dsp_conf:
         dither: 0.1
+        remove_dc_offset: true
+        preemphasis_coefficient: 0.97
     spec_aug: true
     spec_aug_conf:
         num_t_mask: 2
-        num_f_mask: 2
+        num_f_mask: 0
         max_t: 50
         max_f: 10
     shuffle: true

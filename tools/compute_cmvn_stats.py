@@ -47,19 +47,17 @@ class CollateFunc(object):
                 waveform, sample_rate = torchaudio.load(item[1])
 
             waveform = waveform * (1 << 15)
-            if self.resample_rate != 0 and self.resample_rate != sample_rate:
-                resample_rate = self.resample_rate
-                waveform = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, new_freq=resample_rate)(waveform)
+            row_means = torch.mean(waveform, dim=1).unsqueeze(1)  # size (m, 1)
+            waveform = waveform - row_means
 
-            mat = kaldi.fbank(waveform,
-                              num_mel_bins=self.feat_dim,
-                              dither=0.0,
-                              energy_floor=0.0,
-                              sample_frequency=resample_rate)
-            mean_stat += torch.sum(mat, axis=0)
-            var_stat += torch.sum(torch.square(mat), axis=0)
-            number += mat.shape[0]
+            offset_waveform = torch.nn.functional.pad(waveform.unsqueeze(0), (1, 0), mode="replicate").squeeze(
+                0
+            )  # size (m, window_size + 1)
+            mat = waveform - 0.97 * offset_waveform[:, :-1]
+
+            mean_stat += torch.sum(mat, axis=1)
+            var_stat += torch.sum(torch.square(mat), axis=1)
+            number += mat.shape[1]
         return number, mean_stat, var_stat
 
 
@@ -98,7 +96,7 @@ if __name__ == '__main__':
 
     with open(args.train_config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
-    feat_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+    feat_dim = 1
     resample_rate = 0
     if 'resample_conf' in configs['dataset_conf']:
         resample_rate = configs['dataset_conf']['resample_conf']['resample_rate']

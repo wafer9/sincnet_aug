@@ -174,14 +174,10 @@ def main():
                                 num_workers=args.num_workers,
                                 prefetch_factor=args.prefetch)
 
-    if 'fbank_conf' in configs['dataset_conf']:
-        input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
-    else:
-        input_dim = configs['dataset_conf']['mfcc_conf']['num_mel_bins']
     vocab_size = len(symbol_table)
 
     # Save configs to model_dir/train.yaml for inference and export
-    configs['input_dim'] = input_dim
+    configs['input_dim'] = 80
     configs['output_dim'] = vocab_size
     configs['cmvn_file'] = args.cmvn
     configs['is_json_cmvn'] = True
@@ -200,9 +196,9 @@ def main():
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    if args.rank == 0:
-        script_model = torch.jit.script(model)
-        script_model.save(os.path.join(args.model_dir, 'init.zip'))
+    # if args.rank == 0:
+    #     script_model = torch.jit.script(model)
+    #     script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:

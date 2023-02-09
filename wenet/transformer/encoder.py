@@ -36,6 +36,7 @@ from wenet.transformer.subsampling import LinearNoSubsampling
 from wenet.utils.common import get_activation
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.mask import add_optional_chunk_mask
+from wenet.transformer.sincnet import SincConv_fast
 
 
 class BaseEncoder(torch.nn.Module):
@@ -127,6 +128,7 @@ class BaseEncoder(torch.nn.Module):
         self.static_chunk_size = static_chunk_size
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
+        self.sinc = SincConv_fast(out_channels=80, kernel_size=251, stride=4, sample_rate=16000)
 
     def output_size(self) -> int:
         return self._output_size
@@ -161,6 +163,7 @@ class BaseEncoder(torch.nn.Module):
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
+        xs = self.sinc(xs)      # (b, t, 1) -> (b, frame, 80)
         xs, pos_emb, masks = self.embed(xs, masks)
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks,

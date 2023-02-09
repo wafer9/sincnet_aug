@@ -46,7 +46,7 @@ train_set=train
 # 6. conf/train_u2++_transformer.yaml: U2++ transformer
 train_config=conf/train_conformer.yaml
 cmvn=true
-dir=exp/conformer
+dir=exp/conformer_large_no_specaug
 checkpoint=
 
 # use average_checkpoint will get better result
